@@ -8,6 +8,8 @@ use quick_xml::events::Event;
 use quick_xml::name::QName;
 use quick_xml::reader::Reader;
 
+// mod rust;
+
 fn get_attributes(event: &Event) -> HashMap<String, String> {
     let attrs = match &event {
         Event::Start(e) => e.attributes(),
@@ -268,26 +270,49 @@ fn strip_prefix<'a>(prefix: &str, s: &'a str) -> &'a str {
 //     fn CreateSync(dpy: EGLDisplay, r#type: EGLenum, attrib_list: *const EGLAttrib) -> EGLSync;
 // }
 
+fn with_c_void(s: &str) -> &str {
+    match s {
+        "void" => "std::ffi::c_void",
+        "int" => "std::ffi::c_int",
+        s => s
+    }
+}
+
 fn convert_param_type(type_name: &str) -> Cow<'_, str> {
-    if let Some(type_name) = type_name.strip_suffix(" *") {
+    const REMAP: [(&str, &str); 2] = [
+        ("const void **", "*const *const std::ffi::c_void"),
+        ("void **", "*mut *mut std::ffi::c_void"),
+        // ("const GLubyte *", "*const GLubyte")
+    ];
+
+    if let Some(type_name) = type_name.strip_suffix(" *const*") {
         if let Some(type_name) = type_name.strip_prefix("const ") {
-            Cow::Owned(format!("*const {}", type_name))
+            Cow::Owned(format!("*const *const {}", with_c_void(type_name)))
         } else {
-            Cow::Owned(format!("*mut {}", type_name))
+            todo!()
+        }
+    } else if let Some(type_name) = type_name.strip_suffix(" *") {
+        if let Some(type_name) = type_name.strip_prefix("const ") {
+            Cow::Owned(format!("*const {}", with_c_void(type_name)))
+        } else {
+            let type_name = type_name.strip_prefix("struct ").unwrap_or(type_name);
+            Cow::Owned(format!("*mut {}", with_c_void(type_name)))
         }
     } else {
-        Cow::Borrowed(type_name)
+        if let Some((_, to)) = REMAP.iter().find(|(from, _to)| *from == type_name) {
+            Cow::Borrowed(to)
+        } else {
+            Cow::Borrowed(type_name)
+        }
     }
+}
 
-    // if type_name.ends_with(" *") {
-//         if let Some(type) = expression {
-
-// };
-
-        // if type_name.starts_with("const ") {
-        //     format!("*const {}", type_name[6..])
-        // }
-    // }
+fn rename_param(param_name: &str) -> &str {
+    match param_name {
+        "type" => "r#type",
+        "ref" => "r#ref",
+        s => s
+    }
 }
 
 fn write_rust_declarations<'a, O: std::io::Write>(
@@ -313,6 +338,7 @@ fn write_rust_declarations<'a, O: std::io::Write>(
         };
     };
 
+    writeln!(output, "#[allow(non_camel_case_types)]\n").unwrap();
     writeln!(output, "pub mod {} {{", module_name).unwrap();
 
     if let Some(prepend) = prepend {
@@ -320,7 +346,14 @@ fn write_rust_declarations<'a, O: std::io::Write>(
     };
 
     writeln!(output, "// {} constants:", constants.len()).unwrap();
-    let strip = |s| strip_prefix(strip_prefix_constant, s);
+    let strip = |s| {
+        let stripped = strip_prefix(strip_prefix_constant, s);
+        if stripped.chars().nth(0).unwrap().is_ascii_digit() {
+            s // cannot start with a number
+        } else {
+            stripped
+        }
+    };
     for EnumValue {
         key,
         value,
@@ -330,7 +363,7 @@ fn write_rust_declarations<'a, O: std::io::Write>(
     {
         write_comment("///", comment, output);
         write_comment("/// alias:", alias, output);
-        writeln!(output, "pub const {}: core::ffi::c_uint = {}", strip(key), value).unwrap();
+        writeln!(output, "pub const {}: core::ffi::c_uint = {};", strip(key), value).unwrap();
     }
 
     writeln!(output, "\n// {} enums:", enums.len()).unwrap();
@@ -371,11 +404,11 @@ fn write_rust_declarations<'a, O: std::io::Write>(
         write!(output, "fn {}(", strip(method_name)).unwrap();
         let params = params
             .iter()
-            .map(|(type_name, name)| format!("{}: {}", name, convert_param_type(type_name)))
+            .map(|(type_name, name)| format!("{}: {}", rename_param(name), convert_param_type(type_name)))
             .collect::<Vec<_>>();
         write!(output, "{})", params.join(", ")).unwrap();
         if return_type != "void" {
-            writeln!(output, " -> {};", return_type).unwrap();
+            writeln!(output, " -> {};", convert_param_type(return_type)).unwrap();
         } else {
             writeln!(output, ";").unwrap();
         }
@@ -403,10 +436,14 @@ fn write_rust_declarations<'a, O: std::io::Write>(
         write!(output, "-> Option<unsafe extern \"C\" fn (").unwrap();
         let params = params
             .iter()
-            .map(|(type_name, _name)| type_name.as_str())
+            .map(|(type_name, _name)| convert_param_type(type_name.as_str()))
             .collect::<Vec<_>>();
         write!(output, "{}", params.join(", ")).unwrap();
-        writeln!(output, ") -> {}> {{", return_type).unwrap();
+        if return_type == "void" {
+            writeln!(output, ")> {{").unwrap();
+        } else {
+            writeln!(output, ") -> {}> {{", convert_param_type(return_type)).unwrap();
+        }
         writeln!(
             output,
             "  loader(\"{}\").map(|ptr| unsafe {{ std::mem::transmute(ptr) }})",
@@ -548,6 +585,7 @@ pub type GLdouble = std::ffi::c_double;
 pub type GLclampf = std::ffi::c_float;
 pub type GLclampd = std::ffi::c_double;
 pub type GLcharARB = std::ffi::c_char;
+pub type GLhandleARB = std::ffi::c_uint;
 ";
 
 const EGL_PREPEND_STR: &str = "
@@ -556,7 +594,7 @@ pub type wl_buffer = *mut std::ffi::c_void;
 pub type wl_display = *mut std::ffi::c_void;
 pub type wl_resource = *mut std::ffi::c_void;
 pub type EGLBoolean = std::ffi::c_uint;
-pub type EGLEnum = std::ffi::c_uint;
+pub type EGLenum = std::ffi::c_uint;
 pub type EGLAttribKHR = isize;
 pub type EGLAttrib = isize;
 pub type EGLClientBuffer = *mut std::ffi::c_void;
