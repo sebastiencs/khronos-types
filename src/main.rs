@@ -1,4 +1,3 @@
-
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
 use std::iter::Peekable;
@@ -14,12 +13,14 @@ fn get_attributes(event: &Event) -> HashMap<String, String> {
         Event::Empty(e) => e.attributes(),
         _ => return HashMap::default(),
     };
-    let attrs = attrs.map(|a| {
-        let attr = a.unwrap();
-        let key = std::str::from_utf8(&attr.key.0).unwrap();
-        let value = std::str::from_utf8(&attr.value).unwrap();
-        (key.to_string(), value.to_string())
-    }).collect();
+    let attrs = attrs
+        .map(|a| {
+            let attr = a.unwrap();
+            let key = std::str::from_utf8(&attr.key.0).unwrap();
+            let value = std::str::from_utf8(&attr.value).unwrap();
+            (key.to_string(), value.to_string())
+        })
+        .collect();
     attrs
 }
 
@@ -53,7 +54,7 @@ impl Parser {
         match self.reader.read_event_into(&mut self.buffer) {
             Ok(Event::Eof) => None,
             Ok(e) => Some(e),
-            Err(_e) => todo!()
+            Err(_e) => todo!(),
         }
     }
 }
@@ -61,7 +62,7 @@ impl Parser {
 fn is_end_of(name: &str, event: &Event) -> bool {
     match &event {
         Event::End(end) if end.name() == QName(name.as_bytes()) => true,
-        _ => false
+        _ => false,
     }
 }
 
@@ -77,12 +78,18 @@ fn collect_until_end_of(until: &str, parser: &mut Parser) -> Vec<Event<'static>>
     events
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Ord)]
 struct EnumValue {
     key: String,
     value: String,
     comment: Option<String>,
-    alias: Option<String>
+    alias: Option<String>,
+}
+
+impl PartialOrd for EnumValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.key.partial_cmp(&other.key)
+    }
 }
 
 #[derive(Debug)]
@@ -104,11 +111,16 @@ fn parse_enum_value(e: &Event) -> Option<EnumValue> {
     let value = attrs.get("value").unwrap().clone();
     let comment = attrs.get("comment").cloned();
     let alias = {
-        attrs.get("alias").map(|alias| {
-            alias.strip_prefix("EGL_").unwrap_or(alias).to_string()
-        })
+        attrs
+            .get("alias")
+            .map(|alias| alias.strip_prefix("EGL_").unwrap_or(alias).to_string())
     };
-    Some(EnumValue { key, value, comment, alias })
+    Some(EnumValue {
+        key,
+        value,
+        comment,
+        alias,
+    })
 }
 
 fn parse_enums(attrs: HashMap<String, String>, parser: &mut Parser) -> Enums {
@@ -137,7 +149,10 @@ struct Method {
     params: Vec<(String, String)>,
 }
 
-fn parse_command_line(expected: &str, commands: &mut Peekable<Iter<'_, Event<'_>>>) -> (String, String) {
+fn parse_command_line(
+    expected: &str,
+    commands: &mut Peekable<Iter<'_, Event<'_>>>,
+) -> (String, String) {
     assert_eq!(get_name(&commands.next().unwrap()), Some(expected));
 
     let mut return_value = Vec::<u8>::with_capacity(16);
@@ -166,7 +181,7 @@ fn parse_command_line(expected: &str, commands: &mut Peekable<Iter<'_, Event<'_>
     (return_value, method_name)
 }
 
-fn parse_commands(parser: &mut Parser, commands_vec: &mut Vec<Method>) {
+fn parse_commands(parser: &mut Parser, commands_map: &mut BTreeMap<String, Method>) {
     let commands = collect_until_end_of("command", parser);
     let mut commands = commands.iter().peekable();
 
@@ -181,11 +196,7 @@ fn parse_commands(parser: &mut Parser, commands_vec: &mut Vec<Method>) {
         params.push((param_type, param_name));
     }
 
-    const IGNORE: [Option<&str>; 3] = [
-        Some("alias"),
-        Some("glx"),
-        Some("vecequiv"),
-    ];
+    const IGNORE: [Option<&str>; 3] = [Some("alias"), Some("glx"), Some("vecequiv")];
 
     while let Some(next) = commands.peek() {
         if !IGNORE.contains(&get_name(*next)) {
@@ -196,13 +207,14 @@ fn parse_commands(parser: &mut Parser, commands_vec: &mut Vec<Method>) {
 
     assert!(commands.next().is_none());
 
-    commands_vec.push(
+    commands_map.insert(
+        method_name.clone(),
         Method {
             return_type,
             method_name,
             params,
-        }
-    )
+        },
+    );
 }
 
 fn parse_extensions(parser: &mut Parser, extension_commands: &mut BTreeSet<String>) {
@@ -211,20 +223,20 @@ fn parse_extensions(parser: &mut Parser, extension_commands: &mut BTreeSet<Strin
 
     while let Some(next) = exts.next() {
         match get_name(next) {
-            None | Some("enum" | "extension" | "require" | "type") => {},
+            None | Some("enum" | "extension" | "require" | "type") => {}
             Some("command") => {
                 extension_commands.insert(get_attributes(next).get("name").unwrap().clone());
             }
-            e => todo!("{:?}", e)
+            e => todo!("{:?}", e),
         }
     }
 }
 
-fn write_rust_declarations<O: std::io::Write>(
+fn write_rust_declarations<'a, O: std::io::Write>(
     enums: &[Enums],
-    constants: &[&EnumValue],
-    commands: &[Method],
-    output: &mut O
+    constants: &BTreeSet<EnumValue>,
+    commands: &BTreeMap<String, Method>,
+    output: &mut O,
 ) {
     let write_comment = |prefix: &str, s: &Option<String>, output: &mut O| {
         if let Some(s) = s {
@@ -233,19 +245,36 @@ fn write_rust_declarations<O: std::io::Write>(
     };
 
     writeln!(output, "// {} constants:", constants.len()).unwrap();
-    for EnumValue { key, value, comment, alias } in constants {
+    for EnumValue {
+        key,
+        value,
+        comment,
+        alias,
+    } in constants.iter()
+    {
         write_comment("///", comment, output);
         write_comment("/// alias:", alias, output);
         writeln!(output, "pub const {}: core::ffi::c_uint = {}", key, value).unwrap();
     }
 
     writeln!(output, "\n// {} enums:", enums.len()).unwrap();
-    for Enums { name, comment, values } in enums {
+    for Enums {
+        name,
+        comment,
+        values,
+    } in enums
+    {
         if let Some(comment) = comment {
             writeln!(output, "/// {}", comment).unwrap();
         };
         writeln!(output, "#[repr(u32)]\npub enum {} {{", name).unwrap();
-        for EnumValue { key, value, comment, alias } in values {
+        for EnumValue {
+            key,
+            value,
+            comment,
+            alias,
+        } in values
+        {
             write_comment("  ///", comment, output);
             write_comment("  /// alias:", alias, output);
             writeln!(output, "  {} = {},", key, value).unwrap();
@@ -254,70 +283,20 @@ fn write_rust_declarations<O: std::io::Write>(
     }
 
     writeln!(output, "\n// {} methods:", commands.len()).unwrap();
-    for Method { return_type, method_name, params } in commands {
+    for Method {
+        return_type,
+        method_name,
+        params,
+    } in commands.values()
+    {
         write!(output, "extern \"system\" unsafe fn {}(", method_name).unwrap();
-        let params = params.iter().map(|(type_name, name)| {
-            format!("{}: {}", name, type_name)
-        }).collect::<Vec<_>>();
+        let params = params
+            .iter()
+            .map(|(type_name, name)| format!("{}: {}", name, type_name))
+            .collect::<Vec<_>>();
         write!(output, "{}", params.join(", ")).unwrap();
         writeln!(output, ") -> {};", return_type).unwrap();
     }
-}
-
-fn egl() {
-    let s = std::fs::read_to_string("egl.xml").unwrap();
-
-    let mut parser = Parser::new(s);
-
-    // skip first lines
-    while let Some(event) = parser.next() {
-        if is_end_of("types", &event) {
-            break;
-        }
-    }
-
-    let mut enums = Vec::with_capacity(1024);
-    let mut constants = Vec::with_capacity(32 * 1024);
-    let mut commands = Vec::with_capacity(32 * 1024);
-    let mut extension_commands = BTreeSet::new();
-
-    while let Some(event) = parser.next() {
-        match &event {
-            Event::Comment(_) => continue,
-            Event::Start(_) => {
-                match &get_name(&event) {
-                    Some("enums") => {
-                        let attrs = get_attributes(&event);
-                        if attrs.get("namespace").unwrap() != "EGL" {
-                            enums.push(parse_enums(attrs, &mut parser));
-                        } else {
-                            constants.extend(parse_constants(&mut parser));
-                        }
-                    }
-                    Some("command") => {
-                        parse_commands(&mut parser, &mut commands);
-                    }
-                    Some("extensions") => {
-                        parse_extensions(&mut parser, &mut extension_commands);
-                    }
-                    Some("feature") => {
-                        let _ = collect_until_end_of("feature", &mut parser);
-                    }
-                    e => eprintln!("ignore {:?}", e),
-                }
-            },
-            e => {
-                eprintln!("ignoring: {:?}", e);
-            }
-        }
-    }
-
-    let sorted = constants.iter().map(|c| {
-        (c.key.as_str(), c)
-    }).collect::<BTreeMap<_, _>>();
-    let constants: Vec<_> = sorted.iter().map(|(_, c)| *c).collect();
-
-    write_rust_declarations(&enums, &constants, &commands, &mut std::io::stdout());
 }
 
 fn parse_xml(path: &str, exclude_namespace: &str) {
@@ -333,34 +312,32 @@ fn parse_xml(path: &str, exclude_namespace: &str) {
     }
 
     let mut enums = Vec::with_capacity(1024);
-    let mut constants = Vec::with_capacity(32 * 1024);
-    let mut commands = Vec::with_capacity(32 * 1024);
+    let mut constants = BTreeSet::new();
+    let mut commands = BTreeMap::new();
     let mut extension_commands = BTreeSet::new();
 
     while let Some(event) = parser.next() {
         match &event {
             Event::Comment(_) => continue,
-            Event::Start(_) => {
-                match &get_name(&event) {
-                    Some("enums") => {
-                        let attrs = get_attributes(&event);
-                        if attrs.get("namespace").unwrap() != exclude_namespace {
-                            enums.push(parse_enums(attrs, &mut parser));
-                        } else {
-                            constants.extend(parse_constants(&mut parser));
-                        }
+            Event::Start(_) => match &get_name(&event) {
+                Some("enums") => {
+                    let attrs = get_attributes(&event);
+                    if attrs.get("namespace").unwrap() != exclude_namespace {
+                        enums.push(parse_enums(attrs, &mut parser));
+                    } else {
+                        constants.extend(parse_constants(&mut parser));
                     }
-                    Some("command") => {
-                        parse_commands(&mut parser, &mut commands);
-                    }
-                    Some("extensions") => {
-                        parse_extensions(&mut parser, &mut extension_commands);
-                    }
-                    Some("feature") => {
-                        let _ = collect_until_end_of("feature", &mut parser);
-                    }
-                    e => eprintln!("ignore {:?}", e),
                 }
+                Some("command") => {
+                    parse_commands(&mut parser, &mut commands);
+                }
+                Some("extensions") => {
+                    parse_extensions(&mut parser, &mut extension_commands);
+                }
+                Some("feature") => {
+                    let _ = collect_until_end_of("feature", &mut parser);
+                }
+                e => eprintln!("ignore {:?}", e),
             },
             e => {
                 eprintln!("ignoring: {:?}", e);
@@ -368,73 +345,14 @@ fn parse_xml(path: &str, exclude_namespace: &str) {
         }
     }
 
-    let sorted = constants.iter().map(|c| {
-        (c.key.as_str(), c)
-    }).collect::<BTreeMap<_, _>>();
-    let constants: Vec<_> = sorted.iter().map(|(_, c)| *c).collect();
-
-    write_rust_declarations(&enums, &constants, &commands, &mut std::io::stdout());
-}
-
-fn gl() {
-    let s = std::fs::read_to_string("gl.xml").unwrap();
-
-    let mut parser = Parser::new(s);
-
-    // skip first lines
-    while let Some(event) = parser.next() {
-        if is_end_of("types", &event) {
-            break;
-        }
-    }
-
-    let mut enums = Vec::with_capacity(1024);
-    let mut constants = Vec::with_capacity(32 * 1024);
-    let mut commands = Vec::with_capacity(32 * 1024);
-    let mut extension_commands = BTreeSet::new();
-
-    while let Some(event) = parser.next() {
-
-        // dbg!(&event, get_name(&event), get_attributes(&event));
-
-        match &event {
-            Event::Comment(_) => continue,
-            Event::Start(_) => {
-                match &get_name(&event) {
-                    Some("enums") => {
-                        let attrs = get_attributes(&event);
-                        if attrs.get("namespace").unwrap() != "GL" {
-                            enums.push(parse_enums(attrs, &mut parser));
-                        } else {
-                            constants.extend(parse_constants(&mut parser));
-                        }
-                    }
-                    Some("command") => {
-                        parse_commands(&mut parser, &mut commands);
-                    }
-                    Some("extensions") => {
-                        parse_extensions(&mut parser, &mut extension_commands);
-                    }
-                    Some("feature") => {
-                        let _ = collect_until_end_of("feature", &mut parser);
-                    }
-                    e => eprintln!("ignore {:?}", e),
-                }
-                // parse_enums(&event, &mut parser)
-            },
-            e => {
-                eprintln!("ignoring: {:?}", e);
-            }
-        }
-    }
-
-    let sorted = constants.iter().map(|c| {
-        (c.key.as_str(), c)
-    }).collect::<BTreeMap<_, _>>();
-    let constants: Vec<_> = sorted.iter().map(|(_, c)| *c).collect();
-
-    dbg!(&extension_commands);
-    dbg!(extension_commands.len());
+    // Extract extensions
+    let extension_commands = extension_commands
+        .iter()
+        .map(|ext| {
+            let method = commands.remove(ext).unwrap();
+            (ext, method)
+        })
+        .collect::<BTreeMap<_, _>>();
 
     write_rust_declarations(&enums, &constants, &commands, &mut std::io::stdout());
 }
@@ -442,7 +360,4 @@ fn gl() {
 fn main() {
     parse_xml("gl.xml", "GL");
     parse_xml("egl.xml", "EGL");
-
-    // egl();
-    // gl();
 }
