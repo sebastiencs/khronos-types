@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
 use std::iter::Peekable;
@@ -104,17 +105,10 @@ fn parse_enum_value(e: &Event) -> Option<EnumValue> {
     if !(attrs.contains_key("value") && attrs.contains_key("name")) {
         return None;
     }
-    let key = {
-        let key = attrs.get("name").unwrap();
-        key.strip_prefix("EGL_").unwrap_or(key).to_string()
-    };
+    let key = attrs.get("name").unwrap().clone();
     let value = attrs.get("value").unwrap().clone();
     let comment = attrs.get("comment").cloned();
-    let alias = {
-        attrs
-            .get("alias")
-            .map(|alias| alias.strip_prefix("EGL_").unwrap_or(alias).to_string())
-    };
+    let alias = attrs.get("alias").cloned();
     Some(EnumValue {
         key,
         value,
@@ -232,20 +226,101 @@ fn parse_extensions(parser: &mut Parser, extension_commands: &mut BTreeSet<Strin
     }
 }
 
+fn strip_prefix<'a>(prefix: &str, s: &'a str) -> &'a str {
+    s.strip_prefix(prefix).unwrap_or(s)
+}
+
+// pub type GLvoid = std::ffi::c_void;
+// pub type GLbyte = std::ffi::c_char;
+// pub type GLubyte = std::ffi::c_uchar;
+// pub type GLchar = std::ffi::c_char;
+// pub type GLboolean = std::ffi::c_uchar;
+// pub type GLshort = std::ffi::c_short;
+// pub type GLushort = std::ffi::c_ushort;
+// pub type GLint = std::ffi::c_int;
+// pub type GLuint = std::ffi::c_uint;
+// pub type GLint64 = i64;
+// pub type GLuint64 = u64;
+// pub type GLintptr = isize;
+// pub type GLsizeiptr = isize;
+// pub type GLintptrARB = isize;
+// pub type GLsizeiptrARB = isize;
+// pub type GLint64EXT = i64;
+// pub type GLuint64EXT = u64;
+// pub type GLsizei = GLint;
+// pub type GLclampx = std::ffi::c_int;
+// pub type GLfixed = GLint;
+// pub type GLhalf = std::ffi::c_ushort;
+// pub type GLhalfNV = std::ffi::c_ushort;
+// pub type GLhalfARB = std::ffi::c_ushort;
+// pub type GLenum = std::ffi::c_uint;
+// pub type GLbitfield = std::ffi::c_uint;
+// pub type GLfloat = std::ffi::c_float;
+// pub type GLdouble = std::ffi::c_double;
+// pub type GLclampf = std::ffi::c_float;
+// pub type GLclampd = std::ffi::c_double;
+// pub type GLcharARB = std::ffi::c_char;
+
+// #[link(name = "GLESv2")]
+// extern "C" {
+//     // fn AreTexturesResident(n: GLsizei, textures: const GLuint *, residences: GLboolean *) -> GLboolean;
+//     fn AreTexturesResident(n: GLsizei, textures: *const GLuint, residences: *mut GLboolean) -> GLboolean;
+//     fn CreateSync(dpy: EGLDisplay, r#type: EGLenum, attrib_list: *const EGLAttrib) -> EGLSync;
+// }
+
+fn convert_param_type(type_name: &str) -> Cow<'_, str> {
+    if let Some(type_name) = type_name.strip_suffix(" *") {
+        if let Some(type_name) = type_name.strip_prefix("const ") {
+            Cow::Owned(format!("*const {}", type_name))
+        } else {
+            Cow::Owned(format!("*mut {}", type_name))
+        }
+    } else {
+        Cow::Borrowed(type_name)
+    }
+
+    // if type_name.ends_with(" *") {
+//         if let Some(type) = expression {
+
+// };
+
+        // if type_name.starts_with("const ") {
+        //     format!("*const {}", type_name[6..])
+        // }
+    // }
+}
+
 fn write_rust_declarations<'a, O: std::io::Write>(
+    params: ParseParams,
     enums: &[Enums],
     constants: &BTreeSet<EnumValue>,
     commands: &BTreeMap<String, Method>,
     extension_commands: &BTreeMap<&String, Method>,
     output: &mut O,
 ) {
+    let ParseParams {
+        module_name,
+        lib_name,
+        strip_prefix_constant,
+        strip_prefix_method,
+        prepend,
+        ..
+    } = params;
+
     let write_comment = |prefix: &str, s: &Option<String>, output: &mut O| {
         if let Some(s) = s {
             writeln!(output, "{} {}", prefix, s).unwrap();
         };
     };
 
+    writeln!(output, "pub mod {} {{", module_name).unwrap();
+
+    if let Some(prepend) = prepend {
+        writeln!(output, "{}", prepend).unwrap();
+    };
+
     writeln!(output, "// {} constants:", constants.len()).unwrap();
+    let strip = |s| strip_prefix(strip_prefix_constant, s);
     for EnumValue {
         key,
         value,
@@ -255,7 +330,7 @@ fn write_rust_declarations<'a, O: std::io::Write>(
     {
         write_comment("///", comment, output);
         write_comment("/// alias:", alias, output);
-        writeln!(output, "pub const {}: core::ffi::c_uint = {}", key, value).unwrap();
+        writeln!(output, "pub const {}: core::ffi::c_uint = {}", strip(key), value).unwrap();
     }
 
     writeln!(output, "\n// {} enums:", enums.len()).unwrap();
@@ -284,20 +359,28 @@ fn write_rust_declarations<'a, O: std::io::Write>(
     }
 
     writeln!(output, "\n// {} methods:", commands.len()).unwrap();
+    writeln!(output, "#[link(name = \"{}\")]", lib_name).unwrap();
+    writeln!(output, "extern \"C\" {{").unwrap();
+    let strip = |s| strip_prefix(strip_prefix_method, s);
     for Method {
         return_type,
         method_name,
         params,
     } in commands.values()
     {
-        write!(output, "extern \"C\" unsafe fn {}(", method_name).unwrap();
+        write!(output, "fn {}(", strip(method_name)).unwrap();
         let params = params
             .iter()
-            .map(|(type_name, name)| format!("{}: {}", name, type_name))
+            .map(|(type_name, name)| format!("{}: {}", name, convert_param_type(type_name)))
             .collect::<Vec<_>>();
-        write!(output, "{}", params.join(", ")).unwrap();
-        writeln!(output, ") -> {};", return_type).unwrap();
+        write!(output, "{})", params.join(", ")).unwrap();
+        if return_type != "void" {
+            writeln!(output, " -> {};", return_type).unwrap();
+        } else {
+            writeln!(output, ";").unwrap();
+        }
     }
+    writeln!(output, "}}").unwrap();
 
     writeln!(
         output,
@@ -332,9 +415,17 @@ fn write_rust_declarations<'a, O: std::io::Write>(
         .unwrap();
         writeln!(output, "}}").unwrap()
     }
+
+    writeln!(output, "}}\n").unwrap();
 }
 
-fn parse_xml(path: &str, exclude_namespace: &str) {
+fn parse_xml(params: ParseParams) {
+    let ParseParams {
+        path,
+        exclude_namespace,
+        ..
+    } = &params;
+
     let s = std::fs::read_to_string(path).unwrap();
 
     let mut parser = Parser::new(s);
@@ -387,6 +478,7 @@ fn parse_xml(path: &str, exclude_namespace: &str) {
         .collect::<BTreeMap<_, _>>();
 
     write_rust_declarations(
+        params,
         &enums,
         &constants,
         &commands,
@@ -395,7 +487,123 @@ fn parse_xml(path: &str, exclude_namespace: &str) {
     );
 }
 
-fn main() {
-    parse_xml("gl.xml", "GL");
-    parse_xml("egl.xml", "EGL");
+struct ParseParams<'a> {
+    path: &'a str,
+    exclude_namespace: &'a str,
+    module_name: &'a str,
+    lib_name: &'a str,
+    strip_prefix_constant: &'a str,
+    strip_prefix_method: &'a str,
+    prepend: Option<&'a str>,
 }
+
+fn main() {
+    parse_xml(ParseParams {
+        path: "gl.xml",
+        exclude_namespace: "GL",
+        module_name: "gl",
+        lib_name: "GLESv2",
+        strip_prefix_constant: "GL_",
+        strip_prefix_method: "gl",
+        prepend: Some(GL_PREPEND_STR),
+    });
+    parse_xml(ParseParams {
+        path: "egl.xml",
+        exclude_namespace: "EGL",
+        module_name: "egl",
+        lib_name: "EGL",
+        strip_prefix_constant: "EGL_",
+        strip_prefix_method: "egl",
+        prepend: Some(EGL_PREPEND_STR),
+    });
+}
+
+const GL_PREPEND_STR: &str = "pub type GLvoid = std::ffi::c_void;
+pub type GLbyte = std::ffi::c_char;
+pub type GLubyte = std::ffi::c_uchar;
+pub type GLchar = std::ffi::c_char;
+pub type GLboolean = std::ffi::c_uchar;
+pub type GLshort = std::ffi::c_short;
+pub type GLushort = std::ffi::c_ushort;
+pub type GLint = std::ffi::c_int;
+pub type GLuint = std::ffi::c_uint;
+pub type GLint64 = i64;
+pub type GLuint64 = u64;
+pub type GLintptr = isize;
+pub type GLsizeiptr = isize;
+pub type GLintptrARB = isize;
+pub type GLsizeiptrARB = isize;
+pub type GLint64EXT = i64;
+pub type GLuint64EXT = u64;
+pub type GLsizei = GLint;
+pub type GLclampx = std::ffi::c_int;
+pub type GLfixed = GLint;
+pub type GLhalf = std::ffi::c_ushort;
+pub type GLhalfNV = std::ffi::c_ushort;
+pub type GLhalfARB = std::ffi::c_ushort;
+pub type GLenum = std::ffi::c_uint;
+pub type GLbitfield = std::ffi::c_uint;
+pub type GLfloat = std::ffi::c_float;
+pub type GLdouble = std::ffi::c_double;
+pub type GLclampf = std::ffi::c_float;
+pub type GLclampd = std::ffi::c_double;
+pub type GLcharARB = std::ffi::c_char;
+";
+
+const EGL_PREPEND_STR: &str = "
+pub type EGLint = std::ffi::c_int;
+pub type wl_buffer = *mut std::ffi::c_void;
+pub type wl_display = *mut std::ffi::c_void;
+pub type wl_resource = *mut std::ffi::c_void;
+pub type EGLBoolean = std::ffi::c_uint;
+pub type EGLEnum = std::ffi::c_uint;
+pub type EGLAttribKHR = isize;
+pub type EGLAttrib = isize;
+pub type EGLClientBuffer = *mut std::ffi::c_void;
+pub type EGLConfig = *mut std::ffi::c_void;
+pub type EGLContext = *mut std::ffi::c_void;
+pub type EGLDeviceEXT = *mut std::ffi::c_void;
+pub type EGLDisplay = *mut std::ffi::c_void;
+pub type EGLImage = *mut std::ffi::c_void;
+pub type EGLImageKHR = *mut std::ffi::c_void;
+pub type EGLLabelKHR = *mut std::ffi::c_void;
+pub type EGLObjectKHR = *mut std::ffi::c_void;
+pub type EGLOutputLayerEXT = *mut std::ffi::c_void;
+pub type EGLOutputPortEXT = *mut std::ffi::c_void;
+pub type EGLStreamKHR = *mut std::ffi::c_void;
+pub type EGLSurface = *mut std::ffi::c_void;
+pub type EGLSync = *mut std::ffi::c_void;
+pub type EGLSyncKHR = *mut std::ffi::c_void;
+pub type EGLSyncNV = *mut std::ffi::c_void;
+pub type khronos_int8_t  = i8;
+pub type khronos_uint8_t = u8;
+pub type khronos_int16_t = i16;
+pub type khronos_uint16_t = u16;
+pub type khronos_int32_t = i32;
+pub type khronos_uint32_t = u32;
+pub type khronos_int64_t = i64;
+pub type khronos_uint64_t = u64;
+pub type khronos_intptr_t = isize;
+pub type khronos_uintptr_t = usize;
+pub type khronos_ssize_t  = isize;
+pub type khronos_usize_t  = usize;
+pub type khronos_float_t = std::ffi::c_float;
+pub type khronos_time_ns_t = u64;
+pub type khronos_stime_nanoseconds_t = i64;
+pub type khronos_utime_nanoseconds_t = u64;
+pub type EGLnsecsANDROID = khronos_stime_nanoseconds_t;
+pub type EGLsizeiANDROID = khronos_ssize_t;
+pub type EGLTimeKHR = khronos_utime_nanoseconds_t;
+pub type EGLTime = khronos_utime_nanoseconds_t;
+pub type EGLTimeNV = khronos_utime_nanoseconds_t;
+pub type EGLuint64KHR = khronos_uint64_t;
+pub type EGLuint64NV = khronos_utime_nanoseconds_t;
+pub type EGLNativeFileDescriptorKHR = std::ffi::c_int;
+#[repr(C)]
+pub struct EGLClientPixmapHI {
+    pData: std::ffi::c_void,
+    iWidth: EGLint,
+    iHeight: EGLint,
+    iStride: EGLint,
+}
+";
