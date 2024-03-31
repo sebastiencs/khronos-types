@@ -236,6 +236,7 @@ fn write_rust_declarations<'a, O: std::io::Write>(
     enums: &[Enums],
     constants: &BTreeSet<EnumValue>,
     commands: &BTreeMap<String, Method>,
+    extension_commands: &BTreeMap<&String, Method>,
     output: &mut O,
 ) {
     let write_comment = |prefix: &str, s: &Option<String>, output: &mut O| {
@@ -289,13 +290,47 @@ fn write_rust_declarations<'a, O: std::io::Write>(
         params,
     } in commands.values()
     {
-        write!(output, "extern \"system\" unsafe fn {}(", method_name).unwrap();
+        write!(output, "extern \"C\" unsafe fn {}(", method_name).unwrap();
         let params = params
             .iter()
             .map(|(type_name, name)| format!("{}: {}", name, type_name))
             .collect::<Vec<_>>();
         write!(output, "{}", params.join(", ")).unwrap();
         writeln!(output, ") -> {};", return_type).unwrap();
+    }
+
+    writeln!(
+        output,
+        "\n// {} extension methods:",
+        extension_commands.len()
+    )
+    .unwrap();
+    for Method {
+        return_type,
+        method_name,
+        params,
+    } in extension_commands.values()
+    {
+        write!(
+            output,
+            "fn load_{}(loader: impl Fn(&str) -> Option<*mut core::ffi::c_void>)",
+            method_name
+        )
+        .unwrap();
+        write!(output, "-> Option<unsafe extern \"C\" fn (").unwrap();
+        let params = params
+            .iter()
+            .map(|(type_name, _name)| type_name.as_str())
+            .collect::<Vec<_>>();
+        write!(output, "{}", params.join(", ")).unwrap();
+        writeln!(output, ") -> {}> {{", return_type).unwrap();
+        writeln!(
+            output,
+            "  loader(\"{}\").map(|ptr| unsafe {{ std::mem::transmute(ptr) }})",
+            method_name
+        )
+        .unwrap();
+        writeln!(output, "}}").unwrap()
     }
 }
 
@@ -348,13 +383,16 @@ fn parse_xml(path: &str, exclude_namespace: &str) {
     // Extract extensions
     let extension_commands = extension_commands
         .iter()
-        .map(|ext| {
-            let method = commands.remove(ext).unwrap();
-            (ext, method)
-        })
+        .map(|ext| (ext, commands.remove(ext).unwrap()))
         .collect::<BTreeMap<_, _>>();
 
-    write_rust_declarations(&enums, &constants, &commands, &mut std::io::stdout());
+    write_rust_declarations(
+        &enums,
+        &constants,
+        &commands,
+        &extension_commands,
+        &mut std::io::stdout(),
+    );
 }
 
 fn main() {
