@@ -8,8 +8,6 @@ use quick_xml::events::Event;
 use quick_xml::name::QName;
 use quick_xml::reader::Reader;
 
-mod rust;
-
 fn get_attributes(event: &Event) -> HashMap<String, String> {
     let attrs = match &event {
         Event::Start(e) => e.attributes(),
@@ -412,7 +410,7 @@ fn write_rust_declarations<'a, O: std::io::Write>(
         params,
     } in commands.values()
     {
-        write!(output, "fn {}(", strip(method_name)).unwrap();
+        write!(output, "pub fn {}(", strip(method_name)).unwrap();
         let params = params
             .iter()
             .map(|(type_name, name)| {
@@ -546,6 +544,8 @@ struct ParseParams<'a, O> {
 }
 
 fn main() {
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+
     let mut dest = Vec::with_capacity(2 * 1024 * 1024 * 1024);
     parse_xml(ParseParams {
         source_path: "gl.xml",
@@ -565,7 +565,7 @@ fn main() {
         prepend: Some(EGL_PREPEND_STR),
         output: &mut dest,
     });
-    std::fs::write("src/test.rs", dest).unwrap();
+    std::fs::write(format!("{}/lib.rs", out_dir), dest).unwrap();
 }
 
 const GL_PREPEND_STR: &str = "pub type GLvoid = core::ffi::c_void;
