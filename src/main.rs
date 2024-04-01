@@ -1,3 +1,7 @@
+#![allow(non_snake_case)]
+#![allow(dead_code)]
+#![allow(non_upper_case_globals)]
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
@@ -8,7 +12,7 @@ use quick_xml::events::Event;
 use quick_xml::name::QName;
 use quick_xml::reader::Reader;
 
-// mod rust;
+mod rust;
 
 fn get_attributes(event: &Event) -> HashMap<String, String> {
     let attrs = match &event {
@@ -232,65 +236,21 @@ fn strip_prefix<'a>(prefix: &str, s: &'a str) -> &'a str {
     s.strip_prefix(prefix).unwrap_or(s)
 }
 
-// pub type GLvoid = std::ffi::c_void;
-// pub type GLbyte = std::ffi::c_char;
-// pub type GLubyte = std::ffi::c_uchar;
-// pub type GLchar = std::ffi::c_char;
-// pub type GLboolean = std::ffi::c_uchar;
-// pub type GLshort = std::ffi::c_short;
-// pub type GLushort = std::ffi::c_ushort;
-// pub type GLint = std::ffi::c_int;
-// pub type GLuint = std::ffi::c_uint;
-// pub type GLint64 = i64;
-// pub type GLuint64 = u64;
-// pub type GLintptr = isize;
-// pub type GLsizeiptr = isize;
-// pub type GLintptrARB = isize;
-// pub type GLsizeiptrARB = isize;
-// pub type GLint64EXT = i64;
-// pub type GLuint64EXT = u64;
-// pub type GLsizei = GLint;
-// pub type GLclampx = std::ffi::c_int;
-// pub type GLfixed = GLint;
-// pub type GLhalf = std::ffi::c_ushort;
-// pub type GLhalfNV = std::ffi::c_ushort;
-// pub type GLhalfARB = std::ffi::c_ushort;
-// pub type GLenum = std::ffi::c_uint;
-// pub type GLbitfield = std::ffi::c_uint;
-// pub type GLfloat = std::ffi::c_float;
-// pub type GLdouble = std::ffi::c_double;
-// pub type GLclampf = std::ffi::c_float;
-// pub type GLclampd = std::ffi::c_double;
-// pub type GLcharARB = std::ffi::c_char;
-
-// #[link(name = "GLESv2")]
-// extern "C" {
-//     // fn AreTexturesResident(n: GLsizei, textures: const GLuint *, residences: GLboolean *) -> GLboolean;
-//     fn AreTexturesResident(n: GLsizei, textures: *const GLuint, residences: *mut GLboolean) -> GLboolean;
-//     fn CreateSync(dpy: EGLDisplay, r#type: EGLenum, attrib_list: *const EGLAttrib) -> EGLSync;
-// }
-
 fn with_c_void(s: &str) -> &str {
     match s {
-        "void" => "std::ffi::c_void",
-        "int" => "std::ffi::c_int",
-        s => s
+        "void" => "core::ffi::c_void",
+        "int" => "core::ffi::c_int",
+        "char" => "core::ffi::c_char",
+        "struct AHardwareBuffer" => "AHardwareBuffer",
+        s => s,
     }
 }
 
+// TODO: Maybe use `regex` here ?
 fn convert_param_type(type_name: &str) -> Cow<'_, str> {
-    const REMAP: [(&str, &str); 2] = [
-        ("const void **", "*const *const std::ffi::c_void"),
-        ("void **", "*mut *mut std::ffi::c_void"),
-        // ("const GLubyte *", "*const GLubyte")
-    ];
-
     if let Some(type_name) = type_name.strip_suffix(" *const*") {
-        if let Some(type_name) = type_name.strip_prefix("const ") {
-            Cow::Owned(format!("*const *const {}", with_c_void(type_name)))
-        } else {
-            todo!()
-        }
+        let type_name = type_name.strip_prefix("const ").unwrap();
+        Cow::Owned(format!("*const *const {}", with_c_void(type_name)))
     } else if let Some(type_name) = type_name.strip_suffix(" *") {
         if let Some(type_name) = type_name.strip_prefix("const ") {
             Cow::Owned(format!("*const {}", with_c_void(type_name)))
@@ -298,12 +258,14 @@ fn convert_param_type(type_name: &str) -> Cow<'_, str> {
             let type_name = type_name.strip_prefix("struct ").unwrap_or(type_name);
             Cow::Owned(format!("*mut {}", with_c_void(type_name)))
         }
-    } else {
-        if let Some((_, to)) = REMAP.iter().find(|(from, _to)| *from == type_name) {
-            Cow::Borrowed(to)
+    } else if let Some(type_name) = type_name.strip_suffix(" **") {
+        if let Some(type_name) = type_name.strip_prefix("const ") {
+            Cow::Owned(format!("*const *const {}", with_c_void(type_name)))
         } else {
-            Cow::Borrowed(type_name)
+            Cow::Owned(format!("*mut *mut {}", with_c_void(type_name)))
         }
+    } else {
+        Cow::Borrowed(type_name)
     }
 }
 
@@ -311,7 +273,34 @@ fn rename_param(param_name: &str) -> &str {
     match param_name {
         "type" => "r#type",
         "ref" => "r#ref",
-        s => s
+        s => s,
+    }
+}
+
+fn make_constant_type(value: &str) -> &str {
+    if value.starts_with("EGL_CAST(") {
+        assert!(value.ends_with(")"));
+        let sep = value.find(',').unwrap();
+        let type_name = &value[9..sep];
+        type_name
+    } else if value == "0xFFFFFFFFFFFFFFFF" {
+        "core::ffi::c_ulonglong"
+    } else {
+        "core::ffi::c_uint"
+    }
+}
+
+fn make_constant_value(s: &str) -> Cow<'_, str> {
+    if s.starts_with("-") {
+        Cow::Owned(format!("{} as _", s))
+    } else if s.starts_with("EGL_CAST(") {
+        assert!(s.ends_with(")"));
+        let sep = s.find(',').unwrap();
+        let type_name = &s[9..sep];
+        let value = &s[sep + 1..s.len() - 1];
+        Cow::Owned(format!("{} as {}", value, type_name))
+    } else {
+        Cow::Borrowed(s)
     }
 }
 
@@ -354,6 +343,7 @@ fn write_rust_declarations<'a, O: std::io::Write>(
             stripped
         }
     };
+    let mut uniques = BTreeSet::new();
     for EnumValue {
         key,
         value,
@@ -361,9 +351,22 @@ fn write_rust_declarations<'a, O: std::io::Write>(
         alias,
     } in constants.iter()
     {
+        let is_unique = uniques.insert(key);
+        let mut dedup_s = "";
+        if is_unique {
+            dedup_s = "2";
+        }
         write_comment("///", comment, output);
         write_comment("/// alias:", alias, output);
-        writeln!(output, "pub const {}: core::ffi::c_uint = {};", strip(key), value).unwrap();
+        writeln!(
+            output,
+            "pub const {}{}: {} = {};",
+            strip(key),
+            dedup_s,
+            make_constant_type(value),
+            make_constant_value(value),
+        )
+        .unwrap();
     }
 
     writeln!(output, "\n// {} enums:", enums.len()).unwrap();
@@ -373,6 +376,7 @@ fn write_rust_declarations<'a, O: std::io::Write>(
         values,
     } in enums
     {
+        let mut uniques = BTreeSet::new();
         if let Some(comment) = comment {
             writeln!(output, "/// {}", comment).unwrap();
         };
@@ -384,14 +388,22 @@ fn write_rust_declarations<'a, O: std::io::Write>(
             alias,
         } in values
         {
-            write_comment("  ///", comment, output);
-            write_comment("  /// alias:", alias, output);
-            writeln!(output, "  {} = {},", key, value).unwrap();
+            let is_unique = uniques.insert(value.as_str());
+            if is_unique {
+                write_comment("  ///", comment, output);
+                write_comment("  /// alias:", alias, output);
+                writeln!(output, "  {} = {},", key, value).unwrap();
+            } else {
+                write_comment("  //", comment, output);
+                write_comment("  // alias:", alias, output);
+                writeln!(output, "  // {} = {},", key, value).unwrap();
+            }
         }
         writeln!(output, "}}").unwrap();
     }
 
     writeln!(output, "\n// {} methods:", commands.len()).unwrap();
+    writeln!(output, "#[allow(clashing_extern_declarations)]").unwrap();
     writeln!(output, "#[link(name = \"{}\")]", lib_name).unwrap();
     writeln!(output, "extern \"C\" {{").unwrap();
     let strip = |s| strip_prefix(strip_prefix_method, s);
@@ -404,7 +416,9 @@ fn write_rust_declarations<'a, O: std::io::Write>(
         write!(output, "fn {}(", strip(method_name)).unwrap();
         let params = params
             .iter()
-            .map(|(type_name, name)| format!("{}: {}", rename_param(name), convert_param_type(type_name)))
+            .map(|(type_name, name)| {
+                format!("{}: {}", rename_param(name), convert_param_type(type_name))
+            })
             .collect::<Vec<_>>();
         write!(output, "{})", params.join(", ")).unwrap();
         if return_type != "void" {
@@ -555,15 +569,15 @@ fn main() {
     });
 }
 
-const GL_PREPEND_STR: &str = "pub type GLvoid = std::ffi::c_void;
-pub type GLbyte = std::ffi::c_char;
-pub type GLubyte = std::ffi::c_uchar;
-pub type GLchar = std::ffi::c_char;
-pub type GLboolean = std::ffi::c_uchar;
-pub type GLshort = std::ffi::c_short;
-pub type GLushort = std::ffi::c_ushort;
-pub type GLint = std::ffi::c_int;
-pub type GLuint = std::ffi::c_uint;
+const GL_PREPEND_STR: &str = "pub type GLvoid = core::ffi::c_void;
+pub type GLbyte = core::ffi::c_char;
+pub type GLubyte = core::ffi::c_uchar;
+pub type GLchar = core::ffi::c_char;
+pub type GLboolean = core::ffi::c_uchar;
+pub type GLshort = core::ffi::c_short;
+pub type GLushort = core::ffi::c_ushort;
+pub type GLint = core::ffi::c_int;
+pub type GLuint = core::ffi::c_uint;
 pub type GLint64 = i64;
 pub type GLuint64 = u64;
 pub type GLintptr = isize;
@@ -573,46 +587,59 @@ pub type GLsizeiptrARB = isize;
 pub type GLint64EXT = i64;
 pub type GLuint64EXT = u64;
 pub type GLsizei = GLint;
-pub type GLclampx = std::ffi::c_int;
+pub type GLclampx = core::ffi::c_int;
 pub type GLfixed = GLint;
-pub type GLhalf = std::ffi::c_ushort;
-pub type GLhalfNV = std::ffi::c_ushort;
-pub type GLhalfARB = std::ffi::c_ushort;
-pub type GLenum = std::ffi::c_uint;
-pub type GLbitfield = std::ffi::c_uint;
-pub type GLfloat = std::ffi::c_float;
-pub type GLdouble = std::ffi::c_double;
-pub type GLclampf = std::ffi::c_float;
-pub type GLclampd = std::ffi::c_double;
-pub type GLcharARB = std::ffi::c_char;
-pub type GLhandleARB = std::ffi::c_uint;
+pub type GLhalf = core::ffi::c_ushort;
+pub type GLhalfNV = core::ffi::c_ushort;
+pub type GLhalfARB = core::ffi::c_ushort;
+pub type GLenum = core::ffi::c_uint;
+pub type GLbitfield = core::ffi::c_uint;
+pub type GLfloat = core::ffi::c_float;
+pub type GLdouble = core::ffi::c_double;
+pub type GLclampf = core::ffi::c_float;
+pub type GLclampd = core::ffi::c_double;
+pub type GLcharARB = core::ffi::c_char;
+pub type GLhandleARB = core::ffi::c_uint;
+pub struct __GLsync;
+pub type GLsync = *mut __GLsync;
+pub type GLeglImageOES = *mut core::ffi::c_void;
+pub type GLeglClientBufferEXT = *mut core::ffi::c_void;
+pub type GLvdpauSurfaceNV = GLintptr;
+pub type GLVULKANPROCNV = extern \"C\" fn();
+pub type GLDEBUGPROC = extern \"C\" fn(GLenum, GLenum, GLuint, GLenum, GLsizei, *const GLchar, *const core::ffi::c_void);
+pub type GLDEBUGPROCARB = extern \"C\" fn(GLenum, GLenum, GLuint, GLenum, GLsizei, *const GLchar, *const core::ffi::c_void);
+pub type GLDEBUGPROCKHR = extern \"C\" fn(GLenum, GLenum, GLuint, GLenum, GLsizei, *const GLchar, *const core::ffi::c_void);
+pub type GLDEBUGPROCAMD = extern \"C\" fn(GLuint, GLenum, GLuint, GLenum, GLsizei, *const GLchar, *const core::ffi::c_void);
+pub struct _cl_event;
+pub struct _cl_context;
 ";
 
 const EGL_PREPEND_STR: &str = "
-pub type EGLint = std::ffi::c_int;
-pub type wl_buffer = *mut std::ffi::c_void;
-pub type wl_display = *mut std::ffi::c_void;
-pub type wl_resource = *mut std::ffi::c_void;
-pub type EGLBoolean = std::ffi::c_uint;
-pub type EGLenum = std::ffi::c_uint;
+pub type EGLint = core::ffi::c_int;
+pub struct AHardwareBuffer;
+pub struct wl_buffer;
+pub struct wl_display;
+pub struct wl_resource;
+pub type EGLBoolean = core::ffi::c_uint;
+pub type EGLenum = core::ffi::c_uint;
 pub type EGLAttribKHR = isize;
 pub type EGLAttrib = isize;
-pub type EGLClientBuffer = *mut std::ffi::c_void;
-pub type EGLConfig = *mut std::ffi::c_void;
-pub type EGLContext = *mut std::ffi::c_void;
-pub type EGLDeviceEXT = *mut std::ffi::c_void;
-pub type EGLDisplay = *mut std::ffi::c_void;
-pub type EGLImage = *mut std::ffi::c_void;
-pub type EGLImageKHR = *mut std::ffi::c_void;
-pub type EGLLabelKHR = *mut std::ffi::c_void;
-pub type EGLObjectKHR = *mut std::ffi::c_void;
-pub type EGLOutputLayerEXT = *mut std::ffi::c_void;
-pub type EGLOutputPortEXT = *mut std::ffi::c_void;
-pub type EGLStreamKHR = *mut std::ffi::c_void;
-pub type EGLSurface = *mut std::ffi::c_void;
-pub type EGLSync = *mut std::ffi::c_void;
-pub type EGLSyncKHR = *mut std::ffi::c_void;
-pub type EGLSyncNV = *mut std::ffi::c_void;
+pub type EGLClientBuffer = *mut core::ffi::c_void;
+pub type EGLConfig = *mut core::ffi::c_void;
+pub type EGLContext = *mut core::ffi::c_void;
+pub type EGLDeviceEXT = *mut core::ffi::c_void;
+pub type EGLDisplay = *mut core::ffi::c_void;
+pub type EGLImage = *mut core::ffi::c_void;
+pub type EGLImageKHR = *mut core::ffi::c_void;
+pub type EGLLabelKHR = *mut core::ffi::c_void;
+pub type EGLObjectKHR = *mut core::ffi::c_void;
+pub type EGLOutputLayerEXT = *mut core::ffi::c_void;
+pub type EGLOutputPortEXT = *mut core::ffi::c_void;
+pub type EGLStreamKHR = *mut core::ffi::c_void;
+pub type EGLSurface = *mut core::ffi::c_void;
+pub type EGLSync = *mut core::ffi::c_void;
+pub type EGLSyncKHR = *mut core::ffi::c_void;
+pub type EGLSyncNV = *mut core::ffi::c_void;
 pub type khronos_int8_t  = i8;
 pub type khronos_uint8_t = u8;
 pub type khronos_int16_t = i16;
@@ -625,7 +652,7 @@ pub type khronos_intptr_t = isize;
 pub type khronos_uintptr_t = usize;
 pub type khronos_ssize_t  = isize;
 pub type khronos_usize_t  = usize;
-pub type khronos_float_t = std::ffi::c_float;
+pub type khronos_float_t = core::ffi::c_float;
 pub type khronos_time_ns_t = u64;
 pub type khronos_stime_nanoseconds_t = i64;
 pub type khronos_utime_nanoseconds_t = u64;
@@ -636,12 +663,19 @@ pub type EGLTime = khronos_utime_nanoseconds_t;
 pub type EGLTimeNV = khronos_utime_nanoseconds_t;
 pub type EGLuint64KHR = khronos_uint64_t;
 pub type EGLuint64NV = khronos_utime_nanoseconds_t;
-pub type EGLNativeFileDescriptorKHR = std::ffi::c_int;
+pub type EGLNativeFileDescriptorKHR = core::ffi::c_int;
 #[repr(C)]
 pub struct EGLClientPixmapHI {
-    pData: std::ffi::c_void,
+    pData: core::ffi::c_void,
     iWidth: EGLint,
     iHeight: EGLint,
     iStride: EGLint,
 }
+pub type EGLNativeDisplayType = *mut core::ffi::c_void;
+pub type EGLNativePixmapType = *mut core::ffi::c_void;
+pub type EGLNativeWindowType = *mut core::ffi::c_void;
+pub type EGLGetBlobFuncANDROID = extern \"C\" fn (*const core::ffi::c_void, EGLsizeiANDROID, *mut core::ffi::c_void, EGLsizeiANDROID) -> EGLsizeiANDROID;
+pub type EGLSetBlobFuncANDROID = extern \"C\" fn (*const core::ffi::c_void, EGLsizeiANDROID, *const core::ffi::c_void, EGLsizeiANDROID);
+pub type EGLDEBUGPROCKHR = extern \"C\" fn (EGLenum, *const core::ffi::c_char, EGLint, EGLLabelKHR, EGLLabelKHR, *const core::ffi::c_char);
+pub type __eglMustCastToProperFunctionPointerType = *mut core::ffi::c_void;
 ";
