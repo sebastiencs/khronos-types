@@ -1,7 +1,3 @@
-#![allow(non_snake_case)]
-#![allow(dead_code)]
-#![allow(non_upper_case_globals)]
-
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
@@ -126,7 +122,10 @@ fn parse_enum_value(e: &Event) -> Option<EnumValue> {
 fn parse_enums(attrs: HashMap<String, String>, parser: &mut Parser) -> Enums {
     let enums = collect_until_end_of("enums", parser);
 
-    let name = attrs.get("namespace").unwrap().to_string();
+    let name = match attrs.get("group") {
+        Some(name) => name.to_string(),
+        None => attrs.get("namespace").unwrap().to_string(),
+    };
     let comment = attrs.get("comment").map(|s| s.to_string());
     let values = enums.iter().filter_map(parse_enum_value).collect();
 
@@ -305,12 +304,11 @@ fn make_constant_value(s: &str) -> Cow<'_, str> {
 }
 
 fn write_rust_declarations<'a, O: std::io::Write>(
-    params: ParseParams,
+    params: ParseParams<O>,
     enums: &[Enums],
     constants: &BTreeSet<EnumValue>,
     commands: &BTreeMap<String, Method>,
     extension_commands: &BTreeMap<&String, Method>,
-    output: &mut O,
 ) {
     let ParseParams {
         module_name,
@@ -318,6 +316,7 @@ fn write_rust_declarations<'a, O: std::io::Write>(
         strip_prefix_constant,
         strip_prefix_method,
         prepend,
+        output,
         ..
     } = params;
 
@@ -327,7 +326,7 @@ fn write_rust_declarations<'a, O: std::io::Write>(
         };
     };
 
-    writeln!(output, "#[allow(non_camel_case_types)]\n").unwrap();
+    writeln!(output, "#[allow(non_camel_case_types, non_snake_case, dead_code, non_upper_case_globals)]").unwrap();
     writeln!(output, "pub mod {} {{", module_name).unwrap();
 
     if let Some(prepend) = prepend {
@@ -392,11 +391,11 @@ fn write_rust_declarations<'a, O: std::io::Write>(
             if is_unique {
                 write_comment("  ///", comment, output);
                 write_comment("  /// alias:", alias, output);
-                writeln!(output, "  {} = {},", key, value).unwrap();
+                writeln!(output, "  {} = {},", strip(key), value).unwrap();
             } else {
                 write_comment("  //", comment, output);
                 write_comment("  // alias:", alias, output);
-                writeln!(output, "  // {} = {},", key, value).unwrap();
+                writeln!(output, "  // {} = {},", strip(key), value).unwrap();
             }
         }
         writeln!(output, "}}").unwrap();
@@ -443,7 +442,7 @@ fn write_rust_declarations<'a, O: std::io::Write>(
     {
         write!(
             output,
-            "fn load_{}(loader: impl Fn(&str) -> Option<*mut core::ffi::c_void>)",
+            "pub fn load_{}(loader: impl Fn(&core::ffi::CStr) -> Option<*mut core::ffi::c_void>)",
             method_name
         )
         .unwrap();
@@ -460,7 +459,7 @@ fn write_rust_declarations<'a, O: std::io::Write>(
         }
         writeln!(
             output,
-            "  loader(\"{}\").map(|ptr| unsafe {{ std::mem::transmute(ptr) }})",
+            "  loader(c\"{}\").map(|ptr| unsafe {{ std::mem::transmute(ptr) }})",
             method_name
         )
         .unwrap();
@@ -470,10 +469,9 @@ fn write_rust_declarations<'a, O: std::io::Write>(
     writeln!(output, "}}\n").unwrap();
 }
 
-fn parse_xml(params: ParseParams) {
+fn parse_xml<O: std::io::Write>(params: ParseParams<O>) {
     let ParseParams {
-        path,
-        exclude_namespace,
+        source_path: path,
         ..
     } = &params;
 
@@ -499,7 +497,7 @@ fn parse_xml(params: ParseParams) {
             Event::Start(_) => match &get_name(&event) {
                 Some("enums") => {
                     let attrs = get_attributes(&event);
-                    if attrs.get("namespace").unwrap() != exclude_namespace {
+                    if attrs.get("type").map(|t| t == "bitmask").unwrap_or(false) {
                         enums.push(parse_enums(attrs, &mut parser));
                     } else {
                         constants.extend(parse_constants(&mut parser));
@@ -534,39 +532,40 @@ fn parse_xml(params: ParseParams) {
         &constants,
         &commands,
         &extension_commands,
-        &mut std::io::stdout(),
     );
 }
 
-struct ParseParams<'a> {
-    path: &'a str,
-    exclude_namespace: &'a str,
+struct ParseParams<'a, O> {
+    source_path: &'a str,
     module_name: &'a str,
     lib_name: &'a str,
     strip_prefix_constant: &'a str,
     strip_prefix_method: &'a str,
     prepend: Option<&'a str>,
+    output: &'a mut O,
 }
 
 fn main() {
+    let mut dest = Vec::with_capacity(2 * 1024 * 1024 * 1024);
     parse_xml(ParseParams {
-        path: "gl.xml",
-        exclude_namespace: "GL",
+        source_path: "gl.xml",
         module_name: "gl",
         lib_name: "GLESv2",
         strip_prefix_constant: "GL_",
         strip_prefix_method: "gl",
         prepend: Some(GL_PREPEND_STR),
+        output: &mut dest,
     });
     parse_xml(ParseParams {
-        path: "egl.xml",
-        exclude_namespace: "EGL",
+        source_path: "egl.xml",
         module_name: "egl",
         lib_name: "EGL",
         strip_prefix_constant: "EGL_",
         strip_prefix_method: "egl",
         prepend: Some(EGL_PREPEND_STR),
+        output: &mut dest,
     });
+    std::fs::write("src/test.rs", dest).unwrap();
 }
 
 const GL_PREPEND_STR: &str = "pub type GLvoid = core::ffi::c_void;
