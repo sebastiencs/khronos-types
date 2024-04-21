@@ -117,9 +117,7 @@ fn parse_enum_value(e: &Event) -> Option<EnumValue> {
     })
 }
 
-fn parse_enums(attrs: HashMap<String, String>, parser: &mut Parser) -> Enums {
-    let enums = collect_until_end_of("enums", parser);
-
+fn parse_enums(attrs: HashMap<String, String>, enums: &[Event]) -> Enums {
     let name = match attrs.get("group") {
         Some(name) => name.to_string(),
         None => attrs.get("namespace").unwrap().to_string(),
@@ -134,8 +132,7 @@ fn parse_enums(attrs: HashMap<String, String>, parser: &mut Parser) -> Enums {
     }
 }
 
-fn parse_constants(parser: &mut Parser) -> Vec<EnumValue> {
-    let enums = collect_until_end_of("enums", parser);
+fn parse_constants(enums: &[Event]) -> Vec<EnumValue> {
     enums.iter().filter_map(parse_enum_value).collect()
 }
 
@@ -270,6 +267,8 @@ fn rename_param(param_name: &str) -> &str {
     match param_name {
         "type" => "r#type",
         "ref" => "r#ref",
+        "box" => "r#box",
+        "in" => "r#in",
         s => s,
     }
 }
@@ -282,8 +281,10 @@ fn make_constant_type(value: &str) -> &str {
         type_name
     } else if value == "0xFFFFFFFFFFFFFFFF" {
         "core::ffi::c_ulonglong"
-    } else {
+    } else if value == "0xFFFFFFFF" || value == "0x80000000" {
         "core::ffi::c_uint"
+    } else {
+        "core::ffi::c_int"
     }
 }
 
@@ -324,7 +325,11 @@ fn write_rust_declarations<'a, O: std::io::Write>(
         };
     };
 
-    writeln!(output, "#[allow(non_camel_case_types, non_snake_case, dead_code, non_upper_case_globals)]").unwrap();
+    writeln!(
+        output,
+        "#[allow(non_camel_case_types, non_snake_case, dead_code, non_upper_case_globals)]"
+    )
+    .unwrap();
     writeln!(output, "pub mod {} {{", module_name).unwrap();
 
     if let Some(prepend) = prepend {
@@ -350,7 +355,7 @@ fn write_rust_declarations<'a, O: std::io::Write>(
     {
         let is_unique = uniques.insert(key);
         let mut dedup_s = "";
-        if is_unique {
+        if !is_unique {
             dedup_s = "2";
         }
         write_comment("///", comment, output);
@@ -410,6 +415,7 @@ fn write_rust_declarations<'a, O: std::io::Write>(
         params,
     } in commands.values()
     {
+        writeln!(output, "#[link_name = \"{}\"]", method_name).unwrap();
         write!(output, "pub fn {}(", strip(method_name)).unwrap();
         let params = params
             .iter()
@@ -432,45 +438,98 @@ fn write_rust_declarations<'a, O: std::io::Write>(
         extension_commands.len()
     )
     .unwrap();
+    let strip = |s| strip_prefix(strip_prefix_method, s);
+
     for Method {
         return_type,
         method_name,
         params,
     } in extension_commands.values()
     {
-        write!(
-            output,
-            "pub fn load_{}(loader: impl Fn(&core::ffi::CStr) -> Option<*mut core::ffi::c_void>)",
-            method_name
-        )
-        .unwrap();
-        write!(output, "-> Option<unsafe extern \"C\" fn (").unwrap();
+        write!(output, "pub unsafe fn {}(", strip(method_name)).unwrap();
+        let params_formatted = params
+            .iter()
+            .map(|(type_name, name)| {
+                format!("{}: {}", rename_param(name), convert_param_type(type_name))
+            })
+            .collect::<Vec<_>>();
+        write!(output, "{})", params_formatted.join(", ")).unwrap();
+        if return_type != "void" {
+            write!(output, " -> {}", convert_param_type(return_type)).unwrap();
+        }
+        writeln!(output, " {{").unwrap();
+
         let params = params
             .iter()
-            .map(|(type_name, _name)| convert_param_type(type_name.as_str()))
-            .collect::<Vec<_>>();
-        write!(output, "{}", params.join(", ")).unwrap();
-        if return_type == "void" {
-            writeln!(output, ")> {{").unwrap();
+            .map(|(_type_name, name)| rename_param(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let return_type = if return_type != "void" {
+            convert_param_type(return_type)
         } else {
-            writeln!(output, ") -> {}> {{", convert_param_type(return_type)).unwrap();
-        }
+            Cow::Borrowed("()")
+        };
+
         writeln!(
             output,
-            "  loader(c\"{}\").map(|ptr| unsafe {{ std::mem::transmute(ptr) }})",
-            method_name
+            "  (core::mem::transmute::<_, fn ({}) -> {}>(ptrs::{}))({})",
+            params_formatted.join(","),
+            return_type,
+            strip(method_name),
+            params
         )
         .unwrap();
-        writeln!(output, "}}").unwrap()
+        writeln!(output, "}}").unwrap();
     }
+
+    writeln!(output, "\nmod ptrs {{").unwrap();
+    writeln!(
+        output,
+        "  fn invalid_fn() {{ panic!(\"method has not been loaded\") }}"
+    )
+    .unwrap();
+    let strip = |s| strip_prefix(strip_prefix_method, s);
+    for Method {
+        return_type: _,
+        method_name,
+        params: _,
+    } in extension_commands.values()
+    {
+        writeln!(
+            output,
+            "  pub static mut {}: *const core::ffi::c_void = invalid_fn as _;",
+            strip(method_name)
+        )
+        .unwrap();
+    }
+    writeln!(output, "}}\n").unwrap();
+
+    writeln!(output, "pub mod load {{").unwrap();
+    let strip = |s| strip_prefix(strip_prefix_method, s);
+    for Method {
+        return_type: _,
+        method_name,
+        params: _,
+    } in extension_commands.values()
+    {
+        writeln!(output, "  pub unsafe fn {}(loader: impl Fn(&core::ffi::CStr) -> Option<*mut core::ffi::c_void>) -> Option<*mut core::ffi::c_void> {{", strip(method_name)).unwrap();
+        writeln!(
+            output,
+            "    loader(c\"{}\").inspect(|ptr| super::ptrs::{} = *ptr as _)",
+            method_name,
+            strip(method_name)
+        )
+        .unwrap();
+        writeln!(output, "  }}").unwrap();
+    }
+    writeln!(output, "}}\n").unwrap();
 
     writeln!(output, "}}\n").unwrap();
 }
 
 fn parse_xml<O: std::io::Write>(params: ParseParams<O>) {
     let ParseParams {
-        source_path: path,
-        ..
+        source_path: path, ..
     } = &params;
 
     let s = std::fs::read_to_string(path).unwrap();
@@ -495,11 +554,11 @@ fn parse_xml<O: std::io::Write>(params: ParseParams<O>) {
             Event::Start(_) => match &get_name(&event) {
                 Some("enums") => {
                     let attrs = get_attributes(&event);
+                    let events = collect_until_end_of("enums", &mut parser);
                     if attrs.get("type").map(|t| t == "bitmask").unwrap_or(false) {
-                        enums.push(parse_enums(attrs, &mut parser));
-                    } else {
-                        constants.extend(parse_constants(&mut parser));
+                        enums.push(parse_enums(attrs, &events));
                     }
+                    constants.extend(parse_constants(&events));
                 }
                 Some("command") => {
                     parse_commands(&mut parser, &mut commands);
@@ -524,13 +583,7 @@ fn parse_xml<O: std::io::Write>(params: ParseParams<O>) {
         .map(|ext| (ext, commands.remove(ext).unwrap()))
         .collect::<BTreeMap<_, _>>();
 
-    write_rust_declarations(
-        params,
-        &enums,
-        &constants,
-        &commands,
-        &extension_commands,
-    );
+    write_rust_declarations(params, &enums, &constants, &commands, &extension_commands);
 }
 
 struct ParseParams<'a, O> {
@@ -546,7 +599,7 @@ struct ParseParams<'a, O> {
 fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
-    let mut dest = Vec::with_capacity(2 * 1024 * 1024 * 1024);
+    let mut dest = Vec::with_capacity(4 * 1024 * 1024 * 1024);
     parse_xml(ParseParams {
         source_path: "gl.xml",
         module_name: "gl",
@@ -611,10 +664,15 @@ pub type GLDEBUGPROCKHR = extern \"C\" fn(GLenum, GLenum, GLuint, GLenum, GLsize
 pub type GLDEBUGPROCAMD = extern \"C\" fn(GLuint, GLenum, GLuint, GLenum, GLsizei, *const GLchar, *const core::ffi::c_void);
 pub struct _cl_event;
 pub struct _cl_context;
+pub type Enum = GLenum;
+pub type Int = GLint;
+pub type Uint = GLuint;
+pub type EglImageOES = GLeglImageOES;
 ";
 
 const EGL_PREPEND_STR: &str = "
 pub type EGLint = core::ffi::c_int;
+pub type Int = EGLint;
 pub struct AHardwareBuffer;
 pub struct wl_buffer;
 pub struct wl_display;
@@ -639,6 +697,17 @@ pub type EGLSurface = *mut core::ffi::c_void;
 pub type EGLSync = *mut core::ffi::c_void;
 pub type EGLSyncKHR = *mut core::ffi::c_void;
 pub type EGLSyncNV = *mut core::ffi::c_void;
+pub type Boolean = EGLBoolean;
+pub type Enum = EGLenum;
+pub type Attrib = EGLAttrib;
+pub type ClientBuffer = EGLClientBuffer;
+pub type Config = EGLConfig;
+pub type Context = EGLContext;
+pub type Display = EGLDisplay;
+pub type Image = EGLImage;
+pub type ImageKHR = EGLImageKHR;
+pub type Surface = EGLSurface;
+pub type Sync = EGLSync;
 pub type khronos_int8_t  = i8;
 pub type khronos_uint8_t = u8;
 pub type khronos_int16_t = i16;
@@ -677,4 +746,56 @@ pub type EGLGetBlobFuncANDROID = extern \"C\" fn (*const core::ffi::c_void, EGLs
 pub type EGLSetBlobFuncANDROID = extern \"C\" fn (*const core::ffi::c_void, EGLsizeiANDROID, *const core::ffi::c_void, EGLsizeiANDROID);
 pub type EGLDEBUGPROCKHR = extern \"C\" fn (EGLenum, *const core::ffi::c_char, EGLint, EGLLabelKHR, EGLLabelKHR, *const core::ffi::c_char);
 pub type __eglMustCastToProperFunctionPointerType = *mut core::ffi::c_void;
+pub type NsecsANDROID = EGLnsecsANDROID;
+pub type SizeiANDROID = EGLsizeiANDROID;
+pub type TimeKHR = EGLTimeKHR;
+pub type Time = EGLTime;
+pub type TimeNV = EGLTimeNV;
+pub type Uint64KHR = EGLuint64KHR;
+pub type Uint64NV = EGLuint64NV;
+pub type NativeFileDescriptorKHR = EGLNativeFileDescriptorKHR;
+pub type ClientPixmapHI = EGLClientPixmapHI;
+pub type NativeDisplayType = EGLNativeDisplayType;
+pub type NativePixmapType = EGLNativePixmapType;
+pub type NativeWindowType = EGLNativeWindowType;
+pub type GetBlobFuncANDROID = EGLGetBlobFuncANDROID;
+pub type SetBlobFuncANDROID = EGLSetBlobFuncANDROID;
+pub type DEBUGPROCKHR = EGLDEBUGPROCKHR;
+#[derive(Debug)]
+pub enum Error {
+    /// EGL is not initialized, or could not be initialized, for the specified EGL
+    /// display connection.
+    NotInitialized,
+    /// EGL cannot access a requested resource (for example a context is bound in
+    /// another thread).
+    BadAccess,
+    /// EGL failed to allocate resources for the requested operation.
+    BadAlloc,
+    /// An unrecognized attribute or attribute value was passed in the attribute list.
+    BadAttribute,
+    /// An EGLContext argument does not name a valid EGL rendering context.
+    BadContext,
+    /// An EGLConfig argument does not name a valid EGL frame buffer configuration.
+    BadConfig,
+    /// The current surface of the calling thread is a window, pixel buffer or pixmap
+    /// that is no longer valid.
+    BadCurrentSurface,
+    /// An EGLDisplay argument does not name a valid EGL display connection.
+    BadDisplay,
+    /// An EGLSurface argument does not name a valid surface (window, pixel buffer or
+    /// pixmap) configured for GL rendering.
+    BadSurface,
+    /// Arguments are inconsistent (for example, a valid context requires buffers not
+    /// supplied by a valid surface).
+    BadMatch,
+    /// One or more argument values are invalid.
+    BadParameter,
+    /// A NativePixmapType argument does not refer to a valid native pixmap.
+    BadNativePixmap,
+    /// A NativeWindowType argument does not refer to a valid native window.
+    BadNativeWindow,
+    /// A power management event has occurred. The application must destroy all contexts
+    /// and reinitialise OpenGL ES state and objects to continue rendering.
+    ContextLost,
+}
 ";
